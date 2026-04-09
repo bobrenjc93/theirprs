@@ -1,0 +1,12 @@
+{
+  "name": "theirprs",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node --watch --watch-path=server.js --watch-path=public --watch-path=sleep.json server.js",
+    "start:once": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
