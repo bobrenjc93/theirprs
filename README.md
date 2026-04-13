@@ -1,53 +1,100 @@
 # theirprs
 
-Small local app for reviewing GitHub pull requests that need your attention.
+`theirprs` is a local review queue for pull requests that need your attention.
 
-It shows open PRs where:
+It is built for the case where you want to focus on review work from other people without manually filtering GitHub notifications, inbox views, or the web PR list.
 
-- review is requested from `@me`
-- the PR author is someone else
-- the PR is not a draft
-- your review is not already `APPROVED`
-- your review is not already `CHANGES_REQUESTED`
+## What It Shows
 
-The UI groups PRs by repository and lets you temporarily "sleep" PRs for a week.
+The app starts from open pull requests where review is requested from `@me`, then filters out PRs that are not actionable:
+
+- PRs authored by you
+- draft PRs
+- PRs you have already `APPROVED`
+- PRs where you have already left `CHANGES_REQUESTED`
+
+The result is a tighter list of review requests that still need an initial decision from you.
+
+## Features
+
+- Groups review requests by repository
+- Shows the PR author on each item
+- Sorts by oldest first or newest first
+- Lets you sleep PRs for a week to temporarily hide them
+- Supports wake-up for individual sleeping PRs
+- Supports shift-click multi-select for bulk sleep actions
+- Shows sleeping PRs on demand
+- Stores sleeping state locally in `sleep.json`
+- Includes a watch-mode dev server for quick local iteration
 
 ## Requirements
 
 - Node.js
-- `gh` CLI
-- GitHub authentication via `gh auth login`
+- GitHub CLI (`gh`)
+- A GitHub CLI session authenticated as the reviewer whose queue you want to see
+
+Check your current login with:
+
+```sh
+gh auth status
+```
 
 ## Install
 
-```bash
+```sh
 npm install
 ```
 
 ## Run
 
-Hot-reloading dev server:
+Start the watch-mode development server:
 
-```bash
+```sh
 npm start
 ```
 
-If port `3000` is already in use:
+By default the app listens on <http://localhost:3000>.
 
-```bash
+If that port is already in use, choose a different one:
+
+```sh
 PORT=3001 npm start
 ```
 
-Open the app in your browser at `http://localhost:3000` or the port you chose.
+To run without file watching:
 
-For a one-shot server without file watching:
-
-```bash
+```sh
 npm run start:once
 ```
 
+## Using The Dashboard
+
+- Click a repository header to collapse or expand that group
+- Use `Oldest first` to flip the sort direction
+- Use `Sleeping` to reveal items you have snoozed
+- Select one or more PRs, then use `Sleep 1 week` in the action bar
+- Hold `Shift` while selecting to bulk-select a contiguous range
+- Use `Refresh` to re-run the GitHub queries
+
 ## Notes
 
-- The server restarts automatically when `server.js`, files under `public/`, or `sleep.json` change.
-- Browser tabs do not auto-refresh; refresh manually after frontend edits.
-- Sleeping PRs are stored locally in `sleep.json`.
+The server watches `server.js`, `public/`, and `sleep.json` when you run `npm start`. Browser tabs do not auto-refresh, so after frontend edits you still need to reload the page manually.
+
+Sleeping state is purely local. Deleting `sleep.json` resets all snoozed items.
+
+## How It Works
+
+The backend uses the GitHub CLI to:
+
+- find open PRs where review is requested from `@me`
+- resolve your current GitHub login
+- fetch per-repository review decision data
+- remove PRs that are already handled or not actionable
+
+This keeps the view centered on outstanding review work rather than every PR you can see.
+
+## Troubleshooting
+
+- If the list is unexpectedly empty, confirm you are logged into the intended GitHub account with `gh auth status`
+- If the server fails to load data, make sure `gh` is installed and available in the same shell that launches the app
+- If watch mode is noisy or unnecessary for your use case, use `npm run start:once`
