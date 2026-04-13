@@ -56,15 +56,6 @@ To run without file watching:
 npm run start:once
 ```
 
-## Using The Dashboard
-
-- Click a repository header to collapse or expand that group
-- Use `Oldest first` to flip the sort direction
-- Use `Sleeping` to reveal items you have snoozed
-- Select one or more PRs, then use `Sleep 1 week` in the action bar
-- Hold `Shift` while selecting to bulk-select a contiguous range
-- Use `Refresh` to re-run the GitHub queries
-
 ## Notes
 
 The server watches `server.js`, `public/`, and `sleep.json` when you run `npm start`. Browser tabs do not auto-refresh, so after frontend edits you still need to reload the page manually.
