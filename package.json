@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "prestart": "node -e \"const fs = require('fs'); if (!fs.existsSync('sleep.json')) fs.writeFileSync('sleep.json', '{}\\\\n');\"",
     "start": "node --watch --watch-path=server.js --watch-path=public --watch-path=sleep.json server.js",
     "start:once": "node server.js"
   },
