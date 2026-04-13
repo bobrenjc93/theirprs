@@ -62,17 +62,6 @@ The server watches `server.js`, `public/`, and `sleep.json` when you run `npm st
 
 Sleeping state is purely local. Deleting `sleep.json` resets all snoozed items.
 
-## How It Works
-
-The backend uses the GitHub CLI to:
-
-- find open PRs where review is requested from `@me`
-- resolve your current GitHub login
-- fetch per-repository review decision data
-- remove PRs that are already handled or not actionable
-
-This keeps the view centered on outstanding review work rather than every PR you can see.
-
 ## Troubleshooting
 
 - If the list is unexpectedly empty, confirm you are logged into the intended GitHub account with `gh auth status`
