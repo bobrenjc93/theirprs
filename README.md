@@ -4,17 +4,6 @@
 
 It is built for the case where you want to focus on review work from other people without manually filtering GitHub notifications, inbox views, or the web PR list.
 
-## What It Shows
-
-The app starts from open pull requests where review is requested from `@me`, then filters out PRs that are not actionable:
-
-- PRs authored by you
-- draft PRs
-- PRs you have already `APPROVED`
-- PRs where you have already left `CHANGES_REQUESTED`
-
-The result is a tighter list of review requests that still need an initial decision from you.
-
 ## Features
 
 - Groups review requests by repository
