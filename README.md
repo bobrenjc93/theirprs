@@ -1,22 +1,21 @@
 # theirprs
 
-Small local app for reviewing GitHub pull requests that need your attention.
+`theirprs` is a small local review queue for pull requests from other people that still need your attention. It uses the GitHub CLI (`gh`) to query GitHub, filters that data locally, and serves a simple browser UI.
 
-It shows open PRs where:
+## What It Shows
 
-- review is requested from `@me`
-- the PR author is someone else
-- the PR is not a draft
-- your review is not already `APPROVED`
-- your review is not already `CHANGES_REQUESTED`
-
-The UI groups PRs by repository and lets you temporarily "sleep" PRs for a week.
+- Open pull requests with review requested from `@me`
+- Only PRs authored by someone else
+- No draft PRs
+- No PRs where your review decision is already `APPROVED` or `CHANGES_REQUESTED`
+- Results grouped by repository
+- Temporary one-week "sleep" support for PRs you want to hide for now
 
 ## Requirements
 
 - Node.js
-- `gh` CLI
-- GitHub authentication via `gh auth login`
+- [GitHub CLI (`gh`)](https://cli.github.com/)
+- GitHub authentication configured through `gh auth login`
 
 ## Install
 
@@ -26,28 +25,36 @@ npm install
 
 ## Run
 
-Hot-reloading dev server:
+Hot-reloading development server:
 
 ```bash
 npm start
 ```
 
-If port `3000` is already in use:
+Use a different port:
 
 ```bash
 PORT=3001 npm start
 ```
 
-Open the app in your browser at `http://localhost:3000` or the port you chose.
-
-For a one-shot server without file watching:
+Run once without file watching:
 
 ```bash
 npm run start:once
 ```
 
+Open `http://localhost:3000` or the port you selected.
+
+## How It Works
+
+- The server reads your GitHub login with `gh api user --jq .login`.
+- It fetches candidate PRs with `gh search prs --review-requested=@me --state=open`.
+- It then queries each repository with `gh pr list --search review-requested:@me` to collect `reviewDecision` values and filter out PRs you have already fully reviewed.
+- Sleeping state is stored locally in `sleep.json`, and expired entries are removed automatically.
+
 ## Notes
 
-- The server restarts automatically when `server.js`, files under `public/`, or `sleep.json` change.
-- Browser tabs do not auto-refresh; refresh manually after frontend edits.
-- Sleeping PRs are stored locally in `sleep.json`.
+- `npm start` uses Node's `--watch` mode for `server.js`, `public/`, and `sleep.json`.
+- Browser tabs do not auto-refresh after frontend changes; refresh manually.
+- If the UI cannot load data, run `gh auth status` and confirm the authenticated account can read the relevant repositories.
+- Delete `sleep.json` if you want to clear all sleeping PRs.
