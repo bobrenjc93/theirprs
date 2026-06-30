@@ -209,6 +209,25 @@
 
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    .refresh-indicator {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: #8b949e;
+    }
+
+    .refresh-indicator.visible { display: inline-flex; }
+
+    .mini-spinner {
+      width: 13px;
+      height: 13px;
+      border: 2px solid #30363d;
+      border-top-color: #58a6ff;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+
     .error { text-align: center; padding: 40px; color: #f85149; }
 
     .collapsed .pr-list { display: none; }
@@ -402,6 +421,7 @@
   <header>
     <h1>PRs Needing My Review</h1>
     <div class="controls">
+      <span class="refresh-indicator" id="refreshIndicator"><span class="mini-spinner"></span>Refreshing…</span>
       <span class="stats" id="stats"></span>
       <button class="btn" id="sortBtn" title="Toggle sort order">Oldest first</button>
       <button class="btn" id="sleepToggle">Sleeping</button>
@@ -463,6 +483,28 @@
     const blocklistForm = document.getElementById("blocklistForm");
     const blocklistInput = document.getElementById("blocklistInput");
     const blocklistItems = document.getElementById("blocklistItems");
+    const refreshIndicator = document.getElementById("refreshIndicator");
+
+    const CACHE_KEY = "theirprs:cache:v1";
+
+    function loadCache() {
+      try {
+        return JSON.parse(localStorage.getItem(CACHE_KEY));
+      } catch {
+        return null;
+      }
+    }
+
+    function saveCache() {
+      try {
+        localStorage.setItem(
+          CACHE_KEY,
+          JSON.stringify({ prs: allPRs, sleep: sleepData, blocklist })
+        );
+      } catch {
+        // ignore quota / disabled storage
+      }
+    }
 
     function prKey(pr) {
       return `${pr.repository.nameWithOwner}#${pr.number}`;
@@ -485,8 +527,12 @@
       return `${days}d left`;
     }
 
-    async function fetchPRs() {
-      app.innerHTML = '<div class="loading"><div class="spinner"></div><div>Fetching PRs...</div></div>';
+    async function fetchPRs({ background = false } = {}) {
+      if (background) {
+        refreshIndicator.classList.add("visible");
+      } else {
+        app.innerHTML = '<div class="loading"><div class="spinner"></div><div>Fetching PRs...</div></div>';
+      }
 
       try {
         const [prRes, sleepRes, blockRes] = await Promise.all([
@@ -502,12 +548,19 @@
         allPRs = await prRes.json();
         sleepData = await sleepRes.json();
         blocklist = await blockRes.json();
+        saveCache();
         renderBlocklist();
         selected.clear();
         updateActionBar();
         render();
       } catch (e) {
-        app.innerHTML = '<div class="error">Failed to load PRs. Check that `gh` is installed and authenticated.</div>';
+        // On a background refresh, keep the stale results on screen rather
+        // than wiping them out with an error.
+        if (!background) {
+          app.innerHTML = '<div class="error">Failed to load PRs. Check that `gh` is installed and authenticated.</div>';
+        }
+      } finally {
+        refreshIndicator.classList.remove("visible");
       }
     }
 
@@ -783,7 +836,7 @@
       render();
     });
 
-    refreshBtn.addEventListener("click", fetchPRs);
+    refreshBtn.addEventListener("click", () => fetchPRs({ background: allPRs.length > 0 }));
 
     blocklistBtn.addEventListener("click", () => {
       renderBlocklist();
@@ -835,7 +888,17 @@
       updateCheckboxes();
     });
 
-    fetchPRs();
+    const cached = loadCache();
+    if (cached && Array.isArray(cached.prs)) {
+      allPRs = cached.prs;
+      sleepData = cached.sleep || {};
+      blocklist = cached.blocklist || [];
+      renderBlocklist();
+      render();
+      fetchPRs({ background: true });
+    } else {
+      fetchPRs();
+    }
   </script>
 </body>
 </html>
