@@ -6,6 +6,7 @@ const path = require("path");
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const SLEEP_FILE = path.join(__dirname, "sleep.json");
+const BLOCKLIST_FILE = path.join(__dirname, "blocklist.json");
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public"), { etag: false, maxAge: 0 }));
@@ -20,6 +21,19 @@ function readSleep() {
 
 function writeSleep(data) {
   fs.writeFileSync(SLEEP_FILE, JSON.stringify(data, null, 2));
+}
+
+function readBlocklist() {
+  try {
+    const data = JSON.parse(fs.readFileSync(BLOCKLIST_FILE, "utf8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeBlocklist(names) {
+  fs.writeFileSync(BLOCKLIST_FILE, JSON.stringify(names, null, 2));
 }
 
 function getActiveSleep() {
@@ -111,26 +125,46 @@ app.get("/api/prs", async (req, res) => {
           "--limit",
           "200",
           "--json",
-          "number,reviewDecision",
+          "number,reviewDecision,reviewRequests",
         ]);
 
-        const reviewDecisionByNumber = new Map(
-          details.map((detail) => [detail.number, detail.reviewDecision || ""])
-        );
+        const detailByNumber = new Map(details.map((detail) => [detail.number, detail]));
+        const viewer = viewerLogin.toLowerCase();
 
         for (const pr of repoPrs) {
-          pr.reviewDecision = reviewDecisionByNumber.get(pr.number) || "";
+          const detail = detailByNumber.get(pr.number);
+          pr.reviewDecision = (detail && detail.reviewDecision) || "";
+          pr.isActivelyRequested = Boolean(
+            detail &&
+              Array.isArray(detail.reviewRequests) &&
+              detail.reviewRequests.some(
+                (reviewer) => (reviewer.login || "").toLowerCase() === viewer
+              )
+          );
         }
       } catch {
         for (const pr of repoPrs) {
           pr.reviewDecision = "";
+          pr.isActivelyRequested = false;
         }
       }
     }));
 
+    const blocklist = new Set(readBlocklist().map((name) => name.toLowerCase()));
+
     const filtered = prs.filter((pr) => {
       if (!pr.author || pr.author.login === viewerLogin || pr.isDraft) {
         return false;
+      }
+
+      if (blocklist.has(pr.author.login.toLowerCase())) {
+        return false;
+      }
+
+      // A live re-review request always surfaces, even if our prior review left
+      // the aggregate reviewDecision at APPROVED or CHANGES_REQUESTED.
+      if (pr.isActivelyRequested) {
+        return true;
       }
 
       return pr.reviewDecision !== "APPROVED" && pr.reviewDecision !== "CHANGES_REQUESTED";
@@ -173,6 +207,36 @@ app.delete("/api/sleep/:key", (req, res) => {
   delete sleep[req.params.key];
   writeSleep(sleep);
   res.json(sleep);
+});
+
+app.get("/api/blocklist", (req, res) => {
+  res.json(readBlocklist());
+});
+
+app.post("/api/blocklist", (req, res) => {
+  const { name } = req.body;
+
+  if (typeof name !== "string" || !name.trim()) {
+    return res.status(400).json({ error: "name (non-empty string) required" });
+  }
+
+  const cleaned = name.trim().replace(/^@/, "");
+  const blocklist = readBlocklist();
+
+  if (!blocklist.some((existing) => existing.toLowerCase() === cleaned.toLowerCase())) {
+    blocklist.push(cleaned);
+    blocklist.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    writeBlocklist(blocklist);
+  }
+
+  res.json(blocklist);
+});
+
+app.delete("/api/blocklist/:name", (req, res) => {
+  const target = req.params.name.toLowerCase();
+  const blocklist = readBlocklist().filter((name) => name.toLowerCase() !== target);
+  writeBlocklist(blocklist);
+  res.json(blocklist);
 });
 
 app.listen(PORT, () => {
