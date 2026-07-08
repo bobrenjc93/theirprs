@@ -899,6 +899,11 @@
     } else {
       fetchPRs();
     }
+
+    // Auto-refresh in the background every hour so the list stays current
+    // without a manual refresh.
+    const AUTO_REFRESH_MS = 60 * 60 * 1000;
+    setInterval(() => fetchPRs({ background: true }), AUTO_REFRESH_MS);
   </script>
 </body>
 </html>
