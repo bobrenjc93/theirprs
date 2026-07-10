@@ -422,6 +422,7 @@
     <h1>PRs Needing My Review</h1>
     <div class="controls">
       <span class="refresh-indicator" id="refreshIndicator"><span class="mini-spinner"></span>Refreshing…</span>
+      <span class="stats" id="lastUpdated"></span>
       <span class="stats" id="stats"></span>
       <button class="btn" id="sortBtn" title="Toggle sort order">Oldest first</button>
       <button class="btn" id="sleepToggle">Sleeping</button>
@@ -467,12 +468,14 @@
     let selected = new Set();
     let lastClickedKey = null;
     let renderedKeys = [];
+    let lastFetched = null;
 
     const app = document.getElementById("app");
     const sleepToggle = document.getElementById("sleepToggle");
     const sortBtn = document.getElementById("sortBtn");
     const refreshBtn = document.getElementById("refreshBtn");
     const stats = document.getElementById("stats");
+    const lastUpdated = document.getElementById("lastUpdated");
     const actionBar = document.getElementById("actionBar");
     const selCount = document.getElementById("selCount");
     const sleepSelectedBtn = document.getElementById("sleepSelectedBtn");
@@ -499,7 +502,7 @@
       try {
         localStorage.setItem(
           CACHE_KEY,
-          JSON.stringify({ prs: allPRs, sleep: sleepData, blocklist })
+          JSON.stringify({ prs: allPRs, sleep: sleepData, blocklist, lastFetched })
         );
       } catch {
         // ignore quota / disabled storage
@@ -548,6 +551,7 @@
         allPRs = await prRes.json();
         sleepData = await sleepRes.json();
         blocklist = await blockRes.json();
+        lastFetched = Date.now();
         saveCache();
         renderBlocklist();
         selected.clear();
@@ -754,7 +758,12 @@
         </div>`;
     }
 
+    function renderLastUpdated() {
+      lastUpdated.textContent = lastFetched ? `Updated ${timeAgo(lastFetched)}` : "";
+    }
+
     function render() {
+      renderLastUpdated();
       const awakePRs = allPRs.filter((pr) => !isSleeping(pr));
       const sleepingPRs = allPRs.filter((pr) => isSleeping(pr));
       const sorted = [...awakePRs].sort((a, b) => {
@@ -893,6 +902,7 @@
       allPRs = cached.prs;
       sleepData = cached.sleep || {};
       blocklist = cached.blocklist || [];
+      lastFetched = cached.lastFetched || null;
       renderBlocklist();
       render();
       fetchPRs({ background: true });
@@ -904,6 +914,9 @@
     // without a manual refresh.
     const AUTO_REFRESH_MS = 60 * 60 * 1000;
     setInterval(() => fetchPRs({ background: true }), AUTO_REFRESH_MS);
+
+    // Keep the "Updated Xm ago" label current between fetches.
+    setInterval(renderLastUpdated, 60 * 1000);
   </script>
 </body>
 </html>
