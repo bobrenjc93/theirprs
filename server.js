@@ -161,13 +161,19 @@ app.get("/api/prs", async (req, res) => {
         return false;
       }
 
-      // A live re-review request always surfaces, even if our prior review left
-      // the aggregate reviewDecision at APPROVED or CHANGES_REQUESTED.
+      // An approved PR is done — never surface it, even if we're still listed
+      // as a requested reviewer.
+      if (pr.reviewDecision === "APPROVED") {
+        return false;
+      }
+
+      // A live re-review request surfaces even if a prior "changes requested"
+      // review left the aggregate reviewDecision at CHANGES_REQUESTED.
       if (pr.isActivelyRequested) {
         return true;
       }
 
-      return pr.reviewDecision !== "APPROVED" && pr.reviewDecision !== "CHANGES_REQUESTED";
+      return pr.reviewDecision !== "CHANGES_REQUESTED";
     });
 
     res.json(filtered);
