@@ -162,6 +162,15 @@
       font-weight: 500;
     }
 
+    .stale-badge {
+      background: rgba(248, 81, 73, 0.18);
+      color: #f85149;
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+
     .label {
       padding: 1px 6px;
       border-radius: 10px;
@@ -640,6 +649,36 @@
       return `${months}mo ago`;
     }
 
+    // Number of full weekdays (Mon-Fri) elapsed since the given date, so
+    // weekends don't count toward a PR going stale.
+    function workdaysSince(dateStr) {
+      const then = new Date(dateStr);
+      const now = new Date();
+      if (isNaN(then) || now <= then) {
+        return 0;
+      }
+
+      let count = 0;
+      const cursor = new Date(then);
+      while (true) {
+        cursor.setDate(cursor.getDate() + 1);
+        if (cursor > now) {
+          break;
+        }
+
+        const dow = cursor.getDay();
+        if (dow !== 0 && dow !== 6) {
+          count += 1;
+        }
+      }
+
+      return count;
+    }
+
+    function isStale(pr) {
+      return workdaysSince(pr.updatedAt) >= 3;
+    }
+
     function getLabelStyle(label) {
       const hex = label.color;
       const r = parseInt(hex.slice(0, 2), 16);
@@ -742,6 +781,7 @@
                       <a class="pr-title" href="${pr.url}" target="_blank">${escapeHtml(pr.title)}</a>
                       <span class="pr-number">#${pr.number}</span>
                       <span class="review-badge">Review requested</span>
+                      ${isStale(pr) ? `<span class="stale-badge" title="No update in 3+ workdays">Stale</span>` : ""}
                       <span class="author-badge blockable" title="Block this author"
                         onclick="event.stopPropagation(); blockAuthor('${escapeHtml(author)}')">@${escapeHtml(author)}</span>
                       ${sleeping ? `<span class="sleep-badge">Sleeping ${sleepRemaining(pr)}</span>` : ""}
