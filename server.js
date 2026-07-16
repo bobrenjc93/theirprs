@@ -87,83 +87,6 @@ function execGhText(args) {
   });
 }
 
-async function mapPool(items, limit, fn) {
-  const results = new Array(items.length);
-  let next = 0;
-
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await fn(items[index], index);
-    }
-  });
-
-  await Promise.all(workers);
-  return results;
-}
-
-// A PR is "dismissed" once the viewer has had the last word: their most recent
-// comment/review is at or after every other participant's latest activity
-// (comments, reviews, and pushed commits). It resurfaces automatically when the
-// author comments or pushes again.
-async function viewerHadLastWord(pr, viewerLogin) {
-  try {
-    const data = await execGhJson([
-      "pr",
-      "view",
-      String(pr.number),
-      "--repo",
-      pr.repository.nameWithOwner,
-      "--json",
-      "comments,reviews,commits",
-    ]);
-
-    const viewer = viewerLogin.toLowerCase();
-    const time = (value) => (value ? new Date(value).getTime() : 0);
-
-    let viewerLast = 0;
-    let othersLast = time(pr.createdAt);
-
-    for (const comment of data.comments || []) {
-      const mine =
-        comment.viewerDidAuthor ||
-        (comment.author && (comment.author.login || "").toLowerCase() === viewer);
-      const at = time(comment.createdAt);
-      if (mine) {
-        viewerLast = Math.max(viewerLast, at);
-      } else {
-        othersLast = Math.max(othersLast, at);
-      }
-    }
-
-    for (const review of data.reviews || []) {
-      const mine = review.author && (review.author.login || "").toLowerCase() === viewer;
-      const at = time(review.submittedAt);
-      if (mine) {
-        viewerLast = Math.max(viewerLast, at);
-      } else {
-        othersLast = Math.max(othersLast, at);
-      }
-    }
-
-    for (const commit of data.commits || []) {
-      const authors = (commit.authors || []).map((a) => (a.login || "").toLowerCase());
-      // Ignore commits authored solely by the viewer; anyone else's commit is
-      // fresh activity that should keep the PR visible.
-      if (authors.length && authors.every((login) => login === viewer)) {
-        continue;
-      }
-      othersLast = Math.max(othersLast, time(commit.committedDate));
-    }
-
-    return viewerLast > 0 && viewerLast >= othersLast;
-  } catch {
-    // If we can't determine activity, err on the side of keeping the PR visible.
-    return false;
-  }
-}
-
 app.get("/api/prs", async (req, res) => {
   try {
     const [viewerLogin, prs] = await Promise.all([
@@ -253,12 +176,7 @@ app.get("/api/prs", async (req, res) => {
       return pr.reviewDecision !== "CHANGES_REQUESTED";
     });
 
-    // Drop PRs where the viewer has already responded and is waiting on the
-    // author, so posting a comment auto-dismisses the PR from the list.
-    const lastWord = await mapPool(filtered, 8, (pr) => viewerHadLastWord(pr, viewerLogin));
-    const visible = filtered.filter((_, index) => !lastWord[index]);
-
-    res.json(visible);
+    res.json(filtered);
   } catch (e) {
     console.error("gh error:", e.message);
     if (e.stderr) {
