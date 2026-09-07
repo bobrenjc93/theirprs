@@ -125,27 +125,18 @@ app.get("/api/prs", async (req, res) => {
           "--limit",
           "200",
           "--json",
-          "number,reviewDecision,reviewRequests",
+          "number,reviewDecision",
         ]);
 
         const detailByNumber = new Map(details.map((detail) => [detail.number, detail]));
-        const viewer = viewerLogin.toLowerCase();
 
         for (const pr of repoPrs) {
           const detail = detailByNumber.get(pr.number);
           pr.reviewDecision = (detail && detail.reviewDecision) || "";
-          pr.isActivelyRequested = Boolean(
-            detail &&
-              Array.isArray(detail.reviewRequests) &&
-              detail.reviewRequests.some(
-                (reviewer) => (reviewer.login || "").toLowerCase() === viewer
-              )
-          );
         }
       } catch {
         for (const pr of repoPrs) {
           pr.reviewDecision = "";
-          pr.isActivelyRequested = false;
         }
       }
     }));
@@ -167,12 +158,8 @@ app.get("/api/prs", async (req, res) => {
         return false;
       }
 
-      // A live re-review request surfaces even if a prior "changes requested"
-      // review left the aggregate reviewDecision at CHANGES_REQUESTED.
-      if (pr.isActivelyRequested) {
-        return true;
-      }
-
+      // Once anyone has requested changes the ball is in the author's court —
+      // drop it even if we're still listed as a requested reviewer.
       return pr.reviewDecision !== "CHANGES_REQUESTED";
     });
 

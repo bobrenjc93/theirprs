@@ -7,8 +7,8 @@ It shows open PRs where:
 - review is requested from `@me`
 - the PR author is someone else
 - the PR is not a draft
-- your review is not already `APPROVED`
-- your review is not already `CHANGES_REQUESTED`
+- the PR is not already `APPROVED`
+- nobody has requested changes on it (any reviewer's `CHANGES_REQUESTED` hides it)
 
 The UI groups PRs by repository and lets you temporarily "sleep" PRs for a week.
 
