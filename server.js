@@ -87,6 +87,81 @@ function execGhText(args) {
   });
 }
 
+async function loadRemainingOpinionatedReviews(repo, number, reviews) {
+  if (!Array.isArray(reviews?.nodes)) {
+    return;
+  }
+
+  const [owner, name] = repo.split("/");
+  while (reviews.pageInfo?.hasNextPage && reviews.pageInfo.endCursor) {
+    const cursor = reviews.pageInfo.endCursor;
+    try {
+      const result = await execGhJson([
+        "api", "graphql",
+        "-f", `query=query($owner: String!, $name: String!, $number: Int!, $cursor: String!) {
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              latestOpinionatedReviews(first: 100, after: $cursor) {
+                nodes { author { login __typename } state }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }`,
+        "-f", `owner=${owner}`,
+        "-f", `name=${name}`,
+        "-F", `number=${number}`,
+        "-f", `cursor=${cursor}`,
+      ]);
+      const next = result.data?.repository?.pullRequest?.latestOpinionatedReviews;
+      if (!Array.isArray(next?.nodes)) {
+        return;
+      }
+      reviews.nodes.push(...next.nodes);
+      reviews.pageInfo = next.pageInfo;
+      if (reviews.pageInfo?.endCursor === cursor) {
+        return;
+      }
+    } catch {
+      // Keep known reviews, but leave the connection incomplete so a re-request
+      // cannot override a changes request whose reviewers we could not load.
+      return;
+    }
+  }
+}
+
+function hasOtherHumanApproval(detail, viewerLogin) {
+  const reviews = detail?.latestOpinionatedReviews?.nodes;
+  const viewer = viewerLogin.toLowerCase();
+  return Array.isArray(reviews) && reviews.some((review) =>
+    review?.state === "APPROVED" && review.author?.__typename === "User" &&
+    review.author.login && review.author.login.toLowerCase() !== viewer
+  );
+}
+
+function isReReviewRequested(detail, viewerLogin) {
+  const viewer = viewerLogin.toLowerCase();
+  const requested = detail?.reviewRequests?.nodes?.some(
+    (request) => request?.requestedReviewer?.login?.toLowerCase() === viewer
+  );
+  const reviews = detail?.latestOpinionatedReviews;
+
+  // Only override the aggregate decision with complete review information.
+  if (!requested || !Array.isArray(reviews?.nodes) ||
+      reviews.pageInfo?.hasNextPage !== false || reviews.nodes.some((review) => !review)) {
+    return false;
+  }
+
+  const blockers = reviews.nodes.filter((review) => review.state === "CHANGES_REQUESTED");
+
+  // Submitting a review consumes the original request. A current direct request
+  // means the viewer has been asked again, but it cannot clear anyone else's
+  // outstanding changes request. Opinionated reviews also survive later comments.
+  return blockers.length > 0 && blockers.every(
+    (review) => review.author?.login?.toLowerCase() === viewer
+  );
+}
+
 app.get("/api/prs", async (req, res) => {
   try {
     const [viewerLogin, prs] = await Promise.all([
@@ -113,30 +188,42 @@ app.get("/api/prs", async (req, res) => {
 
     await Promise.all([...byRepo.entries()].map(async ([repo, repoPrs]) => {
       try {
+        const [owner, name] = repo.split("/");
+        // Look up the discovered PRs directly: a second search can disagree with
+        // the first, and gh pr list does not expose latestOpinionatedReviews.
+        const query = `query($owner: String!, $name: String!) {
+          repository(owner: $owner, name: $name) {
+            ${repoPrs.map((pr) => `pr${pr.number}: pullRequest(number: ${pr.number}) {
+              reviewDecision
+              reviewRequests(first: 100) {
+                nodes { requestedReviewer { ... on User { login } } }
+              }
+              latestOpinionatedReviews(first: 100) {
+                nodes { author { login __typename } state }
+                pageInfo { hasNextPage endCursor }
+              }
+            }`).join("\n")}
+          }
+        }`;
         const details = await execGhJson([
-          "pr",
-          "list",
-          "--repo",
-          repo,
-          "--state",
-          "open",
-          "--search",
-          "review-requested:@me",
-          "--limit",
-          "200",
-          "--json",
-          "number,reviewDecision",
+          "api", "graphql",
+          "-f", `query=${query}`,
+          "-f", `owner=${owner}`,
+          "-f", `name=${name}`,
         ]);
 
-        const detailByNumber = new Map(details.map((detail) => [detail.number, detail]));
-
-        for (const pr of repoPrs) {
-          const detail = detailByNumber.get(pr.number);
+        await Promise.all(repoPrs.map(async (pr) => {
+          const detail = details.data.repository?.[`pr${pr.number}`];
+          await loadRemainingOpinionatedReviews(repo, pr.number, detail?.latestOpinionatedReviews);
           pr.reviewDecision = (detail && detail.reviewDecision) || "";
-        }
+          pr.hasOtherHumanApproval = hasOtherHumanApproval(detail, viewerLogin);
+          pr.isReReviewRequested = isReReviewRequested(detail, viewerLogin);
+        }));
       } catch {
         for (const pr of repoPrs) {
           pr.reviewDecision = "";
+          pr.hasOtherHumanApproval = false;
+          pr.isReReviewRequested = false;
         }
       }
     }));
@@ -152,15 +239,15 @@ app.get("/api/prs", async (req, res) => {
         return false;
       }
 
-      // An approved PR is done — never surface it, even if we're still listed
-      // as a requested reviewer.
-      if (pr.reviewDecision === "APPROVED") {
+      // Bot approvals do not replace a human review. Our own earlier approval
+      // also does not clear a new request to review again.
+      if (pr.hasOtherHumanApproval) {
         return false;
       }
 
-      // Once anyone has requested changes the ball is in the author's court —
-      // drop it even if we're still listed as a requested reviewer.
-      return pr.reviewDecision !== "CHANGES_REQUESTED";
+      // A fresh request can return our own review to the queue; other reviewers'
+      // outstanding changes requests still leave the ball in the author's court.
+      return pr.reviewDecision !== "CHANGES_REQUESTED" || pr.isReReviewRequested;
     });
 
     res.json(filtered);
@@ -232,6 +319,10 @@ app.delete("/api/blocklist/:name", (req, res) => {
   res.json(blocklist);
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server running at http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
