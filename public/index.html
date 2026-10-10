@@ -47,6 +47,8 @@
     }
 
     .btn:hover { background: #30363d; }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+    .btn:disabled:hover { background: #21262d; }
     .btn.active { background: #1f6feb; border-color: #1f6feb; }
 
     .stats { font-size: 13px; color: #8b949e; }
@@ -539,7 +541,18 @@
       return `${days}d left`;
     }
 
-    async function fetchPRs({ background = false } = {}) {
+    // When the server will next allow a GitHub refresh, and whether that wait
+    // is because GitHub rate-limited us.
+    let nextRefreshAt = null;
+    let rateLimited = false;
+
+    function formatTime(ms) {
+      return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    }
+
+    // Loads the server's results from the last refresh. Only `refresh` (the
+    // Refresh button) asks the server to query GitHub, which it allows hourly.
+    async function fetchPRs({ background = false, refresh = false } = {}) {
       if (background) {
         refreshIndicator.classList.add("visible");
       } else {
@@ -548,19 +561,23 @@
 
       try {
         const [prRes, sleepRes, blockRes] = await Promise.all([
-          fetch("/api/prs"),
+          refresh ? fetch("/api/prs/refresh", { method: "POST" }) : fetch("/api/prs"),
           fetch("/api/sleep"),
           fetch("/api/blocklist"),
         ]);
 
-        if (!prRes.ok) {
+        // A 429 means the refresh was skipped; the body still holds the
+        // current results.
+        if (!prRes.ok && prRes.status !== 429) {
           throw new Error("Failed to fetch PRs");
         }
 
+        nextRefreshAt = Date.parse(prRes.headers.get("X-Next-Refresh-At")) || null;
+        rateLimited = prRes.headers.has("X-Rate-Limited");
         allPRs = await prRes.json();
         sleepData = await sleepRes.json();
         blocklist = await blockRes.json();
-        lastFetched = Date.now();
+        lastFetched = Date.parse(prRes.headers.get("X-Fetched-At")) || null;
         saveCache();
         renderBlocklist();
         selected.clear();
@@ -799,7 +816,17 @@
     }
 
     function renderLastUpdated() {
-      lastUpdated.textContent = lastFetched ? `Updated ${timeAgo(lastFetched)}` : "";
+      const waiting = nextRefreshAt > Date.now();
+      refreshBtn.disabled = waiting;
+      refreshBtn.title = waiting
+        ? `${rateLimited ? "GitHub rate limit hit. " : ""}Next refresh available at ${formatTime(nextRefreshAt)}`
+        : "Fetch the latest PRs from GitHub";
+
+      let text = lastFetched ? `Updated ${timeAgo(lastFetched)}` : "";
+      if (waiting) {
+        text += `${text ? " · " : ""}${rateLimited ? "GitHub rate limit hit, " : ""}next refresh ${formatTime(nextRefreshAt)}`;
+      }
+      lastUpdated.textContent = text;
     }
 
     function render() {
@@ -856,7 +883,9 @@
       let html = "";
 
       if (sorted.length === 0 && (!showSleeping || sleepingPRs.length === 0)) {
-        html = '<div class="loading">No PRs currently need your review.</div>';
+        html = lastFetched
+          ? '<div class="loading">No PRs currently need your review.</div>'
+          : '<div class="loading">No PRs loaded yet. Click Refresh to fetch them from GitHub.</div>';
       } else {
         html = sortedGroups.map(([repo, prs]) => renderGroup(repo, prs, false)).join("");
       }
@@ -885,7 +914,7 @@
       render();
     });
 
-    refreshBtn.addEventListener("click", () => fetchPRs({ background: allPRs.length > 0 }));
+    refreshBtn.addEventListener("click", () => fetchPRs({ background: allPRs.length > 0, refresh: true }));
 
     blocklistBtn.addEventListener("click", () => {
       renderBlocklist();
@@ -950,12 +979,7 @@
       fetchPRs();
     }
 
-    // Auto-refresh in the background every hour so the list stays current
-    // without a manual refresh.
-    const AUTO_REFRESH_MS = 60 * 60 * 1000;
-    setInterval(() => fetchPRs({ background: true }), AUTO_REFRESH_MS);
-
-    // Keep the "Updated Xm ago" label current between fetches.
+    // Keep the "Updated Xm ago" label and Refresh button current between fetches.
     setInterval(renderLastUpdated, 60 * 1000);
   </script>
 </body>

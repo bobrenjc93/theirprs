@@ -1,3 +1,5 @@
 node_modules
 sleep.json
 blocklist.json
+.prs-cache.json
+.prs-cache.json.*.tmp

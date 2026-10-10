@@ -7,6 +7,13 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const SLEEP_FILE = path.join(__dirname, "sleep.json");
 const BLOCKLIST_FILE = path.join(__dirname, "blocklist.json");
+// GitHub is only queried on an explicit refresh, at most once per
+// REFRESH_INTERVAL_MS. Page loads, tabs, and every dev server read one on-disk
+// copy of the results, so they never spend the GraphQL quota (5,000 points/hour,
+// shared with every other gh user on the account).
+const CACHE_FILE = process.env.PRS_CACHE_FILE || path.join(__dirname, ".prs-cache.json");
+const REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+const RATE_LIMIT_FALLBACK_MS = 15 * 60 * 1000;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public"), { etag: false, maxAge: 0 }));
@@ -34,6 +41,21 @@ function readBlocklist() {
 
 function writeBlocklist(names) {
   fs.writeFileSync(BLOCKLIST_FILE, JSON.stringify(names, null, 2));
+}
+
+function readCache() {
+  try {
+    return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeCache(data) {
+  // Write then rename so another server never reads a half-written file.
+  const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data));
+  fs.renameSync(tmp, CACHE_FILE);
 }
 
 function getActiveSleep() {
@@ -87,6 +109,23 @@ function execGhText(args) {
   });
 }
 
+function isRateLimitError(error) {
+  return /rate limit/i.test(`${error?.message}\n${error?.stderr}`);
+}
+
+// Rate-limited responses still carry X-RateLimit-Reset, which gh prints with -i.
+function graphqlRateLimitReset() {
+  return new Promise((resolve) => {
+    execFile("gh", ["api", "-i", "graphql", "-f", "query={ rateLimit { resetAt } }"],
+      { maxBuffer: 1024 * 1024 }, (err, stdout) => {
+        const match = /^x-ratelimit-reset:\s*(\d+)/im.exec(stdout || "");
+        const reset = match ? Number(match[1]) * 1000 : Date.now() + RATE_LIMIT_FALLBACK_MS;
+        // Secondary limits can trip with quota left; still back off briefly.
+        resolve(Math.max(reset, Date.now() + 60 * 1000));
+      });
+  });
+}
+
 async function loadRemainingOpinionatedReviews(repo, number, reviews) {
   if (!Array.isArray(reviews?.nodes)) {
     return;
@@ -122,7 +161,10 @@ async function loadRemainingOpinionatedReviews(repo, number, reviews) {
       if (reviews.pageInfo?.endCursor === cursor) {
         return;
       }
-    } catch {
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        throw error;
+      }
       // Keep known reviews, but leave the connection incomplete so a re-request
       // cannot override a changes request whose reviewers we could not load.
       return;
@@ -162,102 +204,169 @@ function isReReviewRequested(detail, viewerLogin) {
   );
 }
 
-app.get("/api/prs", async (req, res) => {
-  try {
-    const [viewerLogin, prs] = await Promise.all([
-      execGhText(["api", "user", "--jq", ".login"]),
-      execGhJson([
-        "search",
-        "prs",
-        "--review-requested=@me",
-        "--state=open",
-        "--limit=200",
-        "--json",
-        "number,title,repository,updatedAt,url,isDraft,state,createdAt,labels,author",
-      ]),
-    ]);
+async function fetchPRsFromGitHub() {
+  const [viewerLogin, prs] = await Promise.all([
+    execGhText(["api", "user", "--jq", ".login"]),
+    execGhJson([
+      "search",
+      "prs",
+      "--review-requested=@me",
+      "--state=open",
+      "--limit=200",
+      "--json",
+      "number,title,repository,updatedAt,url,isDraft,state,createdAt,labels,author",
+    ]),
+  ]);
 
-    const byRepo = new Map();
-    for (const pr of prs) {
-      const repo = pr.repository.nameWithOwner;
-      if (!byRepo.has(repo)) {
-        byRepo.set(repo, []);
-      }
-      byRepo.get(repo).push(pr);
+  const byRepo = new Map();
+  for (const pr of prs) {
+    const repo = pr.repository.nameWithOwner;
+    if (!byRepo.has(repo)) {
+      byRepo.set(repo, []);
     }
-
-    await Promise.all([...byRepo.entries()].map(async ([repo, repoPrs]) => {
-      try {
-        const [owner, name] = repo.split("/");
-        // Look up the discovered PRs directly: a second search can disagree with
-        // the first, and gh pr list does not expose latestOpinionatedReviews.
-        const query = `query($owner: String!, $name: String!) {
-          repository(owner: $owner, name: $name) {
-            ${repoPrs.map((pr) => `pr${pr.number}: pullRequest(number: ${pr.number}) {
-              reviewDecision
-              reviewRequests(first: 100) {
-                nodes { requestedReviewer { ... on User { login } } }
-              }
-              latestOpinionatedReviews(first: 100) {
-                nodes { author { login __typename } state }
-                pageInfo { hasNextPage endCursor }
-              }
-            }`).join("\n")}
-          }
-        }`;
-        const details = await execGhJson([
-          "api", "graphql",
-          "-f", `query=${query}`,
-          "-f", `owner=${owner}`,
-          "-f", `name=${name}`,
-        ]);
-
-        await Promise.all(repoPrs.map(async (pr) => {
-          const detail = details.data.repository?.[`pr${pr.number}`];
-          await loadRemainingOpinionatedReviews(repo, pr.number, detail?.latestOpinionatedReviews);
-          pr.reviewDecision = (detail && detail.reviewDecision) || "";
-          pr.hasOtherHumanApproval = hasOtherHumanApproval(detail, viewerLogin);
-          pr.isReReviewRequested = isReReviewRequested(detail, viewerLogin);
-        }));
-      } catch {
-        for (const pr of repoPrs) {
-          pr.reviewDecision = "";
-          pr.hasOtherHumanApproval = false;
-          pr.isReReviewRequested = false;
-        }
-      }
-    }));
-
-    const blocklist = new Set(readBlocklist().map((name) => name.toLowerCase()));
-
-    const filtered = prs.filter((pr) => {
-      if (!pr.author || pr.author.login === viewerLogin || pr.isDraft) {
-        return false;
-      }
-
-      if (blocklist.has(pr.author.login.toLowerCase())) {
-        return false;
-      }
-
-      // Bot approvals do not replace a human review. Our own earlier approval
-      // also does not clear a new request to review again.
-      if (pr.hasOtherHumanApproval) {
-        return false;
-      }
-
-      // A fresh request can return our own review to the queue; other reviewers'
-      // outstanding changes requests still leave the ball in the author's court.
-      return pr.reviewDecision !== "CHANGES_REQUESTED" || pr.isReReviewRequested;
-    });
-
-    res.json(filtered);
-  } catch (e) {
-    console.error("gh error:", e.message);
-    if (e.stderr) {
-      console.error(e.stderr);
-    }
-    res.status(500).json({ error: "Failed to fetch PRs" });
+    byRepo.get(repo).push(pr);
   }
+
+  await Promise.all([...byRepo.entries()].map(async ([repo, repoPrs]) => {
+    try {
+      const [owner, name] = repo.split("/");
+      // Look up the discovered PRs directly: a second search can disagree with
+      // the first, and gh pr list does not expose latestOpinionatedReviews.
+      const query = `query($owner: String!, $name: String!) {
+        repository(owner: $owner, name: $name) {
+          ${repoPrs.map((pr) => `pr${pr.number}: pullRequest(number: ${pr.number}) {
+            reviewDecision
+            reviewRequests(first: 100) {
+              nodes { requestedReviewer { ... on User { login } } }
+            }
+            latestOpinionatedReviews(first: 100) {
+              nodes { author { login __typename } state }
+              pageInfo { hasNextPage endCursor }
+            }
+          }`).join("\n")}
+        }
+      }`;
+      const details = await execGhJson([
+        "api", "graphql",
+        "-f", `query=${query}`,
+        "-f", `owner=${owner}`,
+        "-f", `name=${name}`,
+      ]);
+
+      await Promise.all(repoPrs.map(async (pr) => {
+        const detail = details.data.repository?.[`pr${pr.number}`];
+        await loadRemainingOpinionatedReviews(repo, pr.number, detail?.latestOpinionatedReviews);
+        pr.reviewDecision = (detail && detail.reviewDecision) || "";
+        pr.hasOtherHumanApproval = hasOtherHumanApproval(detail, viewerLogin);
+        pr.isReReviewRequested = isReReviewRequested(detail, viewerLogin);
+      }));
+    } catch (error) {
+      // Don't cache a degraded answer: changes-requested PRs would reappear.
+      if (isRateLimitError(error)) {
+        throw error;
+      }
+      for (const pr of repoPrs) {
+        pr.reviewDecision = "";
+        pr.hasOtherHumanApproval = false;
+        pr.isReReviewRequested = false;
+      }
+    }
+  }));
+
+  return { viewerLogin, prs };
+}
+
+function filterPRs(prs, viewerLogin) {
+  const blocklist = new Set(readBlocklist().map((name) => name.toLowerCase()));
+
+  return prs.filter((pr) => {
+    if (!pr.author || pr.author.login === viewerLogin || pr.isDraft) {
+      return false;
+    }
+
+    if (blocklist.has(pr.author.login.toLowerCase())) {
+      return false;
+    }
+
+    // Bot approvals do not replace a human review. Our own earlier approval
+    // also does not clear a new request to review again.
+    if (pr.hasOtherHumanApproval) {
+      return false;
+    }
+
+    // A fresh request can return our own review to the queue; other reviewers'
+    // outstanding changes requests still leave the ball in the author's court.
+    return pr.reviewDecision !== "CHANGES_REQUESTED" || pr.isReReviewRequested;
+  });
+}
+
+let inFlight = null;
+
+// Concurrent requests share one fetch. A rate-limit error records when the
+// quota resets so no further gh calls are made until then.
+function refreshCache(cache) {
+  inFlight ??= (async () => {
+    try {
+      const next = { ...(await fetchPRsFromGitHub()), fetchedAt: Date.now() };
+      writeCache(next);
+      return next;
+    } catch (e) {
+      console.error("gh error:", e.message);
+      if (e.stderr) {
+        console.error(e.stderr);
+      }
+      if (!isRateLimitError(e)) {
+        throw e;
+      }
+      const next = { ...cache, rateLimitedUntil: await graphqlRateLimitReset() };
+      console.error(`GitHub rate limited; pausing gh calls until ${new Date(next.rateLimitedUntil).toLocaleTimeString()}`);
+      writeCache(next);
+      return next;
+    }
+  })().finally(() => {
+    inFlight = null;
+  });
+  return inFlight;
+}
+
+function nextRefreshAt(cache) {
+  return Math.max(cache.fetchedAt ? cache.fetchedAt + REFRESH_INTERVAL_MS : 0, cache.rateLimitedUntil || 0);
+}
+
+function sendPRs(res, cache, status = 200) {
+  const next = nextRefreshAt(cache);
+  if (next > Date.now()) {
+    res.set("X-Next-Refresh-At", new Date(next).toISOString());
+  }
+  if (cache.rateLimitedUntil > Date.now()) {
+    res.set("X-Rate-Limited", "1");
+  }
+  if (cache.fetchedAt) {
+    res.set("X-Fetched-At", new Date(cache.fetchedAt).toISOString());
+  }
+  res.status(status).json(cache.prs ? filterPRs(cache.prs, cache.viewerLogin) : []);
+}
+
+// Never queries GitHub; returns the results of the last refresh (empty before
+// the first one, which X-Fetched-At's absence signals).
+app.get("/api/prs", (req, res) => {
+  sendPRs(res, readCache());
+});
+
+// Queries GitHub unless the last refresh was under an hour ago or we are rate
+// limited; either way the response carries the current results.
+app.post("/api/prs/refresh", async (req, res) => {
+  let cache = readCache();
+  if (nextRefreshAt(cache) > Date.now()) {
+    return sendPRs(res, cache, 429);
+  }
+
+  try {
+    cache = await refreshCache(cache);
+  } catch {
+    return res.status(500).json({ error: "Failed to fetch PRs" });
+  }
+  sendPRs(res, cache, cache.rateLimitedUntil > Date.now() ? 429 : 200);
 });
 
 app.get("/api/sleep", (req, res) => {

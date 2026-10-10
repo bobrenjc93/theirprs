@@ -1,12 +1,14 @@
 const assert = require("node:assert/strict");
 const { once } = require("node:events");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const childProcess = require("node:child_process");
 const { after, afterEach, before, beforeEach, describe, mock, test } = require("node:test");
 
 const VIEWER = "bobrenjc93";
 const REPO = "pytorch/pytorch";
+const CACHE_FILE = path.join(os.tmpdir(), `theirprs-test-cache-${process.pid}.json`);
 let fixture;
 let server;
 let baseUrl;
@@ -52,9 +54,21 @@ async function fetchPRs(prs, detailsByRepo = {}, reviewPages = {}) {
   fixture.prs = prs;
   fixture.detailsByRepo = detailsByRepo;
   fixture.reviewPages = reviewPages;
-  const response = await fetch(`${baseUrl}/api/prs`);
+  // Clear the last refresh so the hourly limit lets this one reach the stubbed gh.
+  fs.rmSync(CACHE_FILE, { force: true });
+  const response = await refresh();
   assert.equal(response.status, 200);
   return response.json();
+}
+
+function refresh() {
+  return fetch(`${baseUrl}/api/prs/refresh`, { method: "POST" });
+}
+
+function expireCache() {
+  const cache = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+  cache.fetchedAt -= 2 * 60 * 60 * 1000;
+  fs.writeFileSync(CACHE_FILE, JSON.stringify(cache));
 }
 
 function ids(prs) {
@@ -74,10 +88,17 @@ describe("GET /api/prs", { concurrency: false }, () => {
     // Stub before loading server.js, which captures execFile when imported.
     mock.method(childProcess, "execFile", (command, args, options, callback) => {
       fixture.calls.push(args);
-      queueMicrotask(() => {
+      const schedule = fixture.delayMs ? (fn) => setTimeout(fn, fixture.delayMs) : queueMicrotask;
+      schedule(() => {
         try {
           assert.equal(command, "gh");
-          if (args[0] === "api" && args[1] === "user") {
+          if (fixture.rateLimitAfter !== undefined && args[1] !== "-i" &&
+              fixture.calls.length > fixture.rateLimitAfter) {
+            const error = new Error("Command failed: gh\nGraphQL: API rate limit already exceeded for user ID 1.");
+            callback(error, "", error.message);
+          } else if (args[0] === "api" && args[1] === "-i") {
+            callback(new Error("rate limited"), `HTTP/2.0 200 OK\nX-Ratelimit-Reset: ${fixture.resetSeconds}\n\n{}`, "");
+          } else if (args[0] === "api" && args[1] === "user") {
             callback(null, `${VIEWER}\n`, "");
           } else if (args[0] === "search" && args[1] === "prs") {
             callback(null, JSON.stringify(fixture.prs), "");
@@ -115,6 +136,7 @@ describe("GET /api/prs", { concurrency: false }, () => {
       });
     });
 
+    process.env.PRS_CACHE_FILE = CACHE_FILE;
     const app = require("./server");
     server = app.listen(0, "127.0.0.1");
     await once(server, "listening");
@@ -123,6 +145,7 @@ describe("GET /api/prs", { concurrency: false }, () => {
 
   beforeEach(() => {
     fixture = { prs: [], detailsByRepo: {}, reviewPages: {}, calls: [], errors: [] };
+    fs.rmSync(CACHE_FILE, { force: true });
   });
 
   afterEach(() => {
@@ -139,6 +162,7 @@ describe("GET /api/prs", { concurrency: false }, () => {
       }
     } finally {
       mock.restoreAll();
+      fs.rmSync(CACHE_FILE, { force: true });
     }
   });
 
@@ -370,5 +394,74 @@ describe("GET /api/prs", { concurrency: false }, () => {
     assert.deepEqual(ids(result), [`${REPO}#42`]);
     assert.equal(fixture.calls.filter((args) => args[0] === "api" && args[1] === "graphql").length, 2);
     assert.equal(fixture.calls.some((args) => args[0] === "pr" && args[1] === "list"), false);
+  });
+
+  test("loading never queries GitHub and applies the blocklist to the last refresh", async () => {
+    const empty = await fetch(`${baseUrl}/api/prs`);
+    assert.deepEqual(await empty.json(), []);
+    assert.equal(empty.headers.get("X-Fetched-At"), null);
+    assert.deepEqual(fixture.calls, []);
+
+    await fetchPRs([pr(1), pr(2, { author: { login: "blocked-author" } })], {
+      [REPO]: [detail(1), detail(2)],
+    });
+    const callsAfterRefresh = fixture.calls.length;
+
+    const response = await fetch(`${baseUrl}/api/prs`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(ids(await response.json()), [`${REPO}#1`]);
+    assert.ok(response.headers.get("X-Fetched-At"));
+    assert.equal(fixture.calls.length, callsAfterRefresh);
+  });
+
+  test("allows one GitHub refresh per hour", async () => {
+    await fetchPRs([pr(1)], { [REPO]: [detail(1)] });
+    fixture.prs = [pr(1), pr(2)];
+    fixture.detailsByRepo = { [REPO]: [detail(1), detail(2)] };
+    fixture.calls = [];
+
+    const throttled = await refresh();
+    assert.equal(throttled.status, 429);
+    assert.deepEqual(ids(await throttled.json()), [`${REPO}#1`]);
+    assert.ok(Date.parse(throttled.headers.get("X-Next-Refresh-At")) > Date.now() + 59 * 60 * 1000);
+    assert.deepEqual(fixture.calls, []);
+
+    expireCache();
+    const response = await refresh();
+    assert.equal(response.status, 200);
+    assert.deepEqual(ids(await response.json()), [`${REPO}#1`, `${REPO}#2`]);
+  });
+
+  test("shares one GitHub fetch between concurrent refreshes", async () => {
+    fixture.prs = [pr(1)];
+    fixture.detailsByRepo = { [REPO]: [detail(1)] };
+    fixture.delayMs = 20;
+    const responses = await Promise.all([1, 2, 3].map(() => refresh()));
+    for (const response of responses) {
+      assert.deepEqual(ids(await response.json()), [`${REPO}#1`]);
+    }
+    assert.equal(fixture.calls.filter((args) => args[0] === "search").length, 1);
+  });
+
+  test("keeps the last good results and blocks refreshes until the rate limit resets", async () => {
+    await fetchPRs([pr(1)], { [REPO]: [detail(1)] });
+
+    // The search succeeds but the per-repo lookup is rate limited, so the
+    // degraded answer must not replace the cached one.
+    fixture.prs = [pr(1), pr(2)];
+    fixture.calls = [];
+    fixture.rateLimitAfter = 2;
+    fixture.resetSeconds = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
+    expireCache();
+    const limited = await refresh();
+    assert.equal(limited.status, 429);
+    assert.deepEqual(ids(await limited.json()), [`${REPO}#1`]);
+    assert.equal(limited.headers.get("X-Rate-Limited"), "1");
+    assert.equal(Date.parse(limited.headers.get("X-Next-Refresh-At")), fixture.resetSeconds * 1000);
+
+    fixture.calls = [];
+    expireCache();
+    assert.equal((await refresh()).status, 429);
+    assert.deepEqual(fixture.calls, []);
   });
 });
