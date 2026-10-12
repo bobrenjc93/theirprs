@@ -7,12 +7,16 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const SLEEP_FILE = path.join(__dirname, "sleep.json");
 const BLOCKLIST_FILE = path.join(__dirname, "blocklist.json");
-// GitHub is only queried on an explicit refresh, at most once per
-// REFRESH_INTERVAL_MS. Page loads, tabs, and every dev server read one on-disk
-// copy of the results, so they never spend the GraphQL quota (5,000 points/hour,
-// shared with every other gh user on the account).
+// GitHub is queried at most once per REFRESH_INTERVAL_MS: automatically by the
+// server, or earlier via the Refresh button if the last fetch is that old. Page
+// loads, tabs, and every dev server read one on-disk copy of the results, so they
+// never spend the GraphQL quota (5,000 points/hour, shared with every other gh
+// user on the account).
 const CACHE_FILE = process.env.PRS_CACHE_FILE || path.join(__dirname, ".prs-cache.json");
 const REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+const AUTO_REFRESH_CHECK_MS = 60 * 1000;
+// After a failed automatic refresh, wait this long before trying again.
+const AUTO_REFRESH_RETRY_MS = 5 * 60 * 1000;
 const RATE_LIMIT_FALLBACK_MS = 15 * 60 * 1000;
 
 app.use(express.json());
@@ -428,10 +432,29 @@ app.delete("/api/blocklist/:name", (req, res) => {
   res.json(blocklist);
 });
 
+let lastAutoRefreshAttempt = 0;
+
+// Refreshes from GitHub once the hour is up (or a rate limit has reset), so the
+// list stays current without a click. Reading the timestamp from the cache file
+// means --watch restarts don't trigger extra fetches.
+function autoRefreshIfDue() {
+  const cache = readCache();
+  const now = Date.now();
+  if (nextRefreshAt(cache) > now || now - lastAutoRefreshAttempt < AUTO_REFRESH_RETRY_MS) {
+    return;
+  }
+  lastAutoRefreshAttempt = now;
+  refreshCache(cache).catch(() => {
+    // refreshCache already logged the error; try again after the retry delay.
+  });
+}
+
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
   });
+  autoRefreshIfDue();
+  setInterval(autoRefreshIfDue, AUTO_REFRESH_CHECK_MS);
 }
 
 module.exports = app;

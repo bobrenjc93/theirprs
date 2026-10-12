@@ -545,13 +545,15 @@
     // is because GitHub rate-limited us.
     let nextRefreshAt = null;
     let rateLimited = false;
+    let refreshFailed = false;
 
     function formatTime(ms) {
       return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     }
 
-    // Loads the server's results from the last refresh. Only `refresh` (the
-    // Refresh button) asks the server to query GitHub, which it allows hourly.
+    // Loads the server's results from the last refresh. The server refreshes from
+    // GitHub hourly on its own; `refresh` (the Refresh button) asks it to do so
+    // now, which it allows once the last fetch is an hour old.
     async function fetchPRs({ background = false, refresh = false } = {}) {
       if (background) {
         refreshIndicator.classList.add("visible");
@@ -572,6 +574,9 @@
           throw new Error("Failed to fetch PRs");
         }
 
+        if (refresh) {
+          refreshFailed = false;
+        }
         nextRefreshAt = Date.parse(prRes.headers.get("X-Next-Refresh-At")) || null;
         rateLimited = prRes.headers.has("X-Rate-Limited");
         allPRs = await prRes.json();
@@ -585,7 +590,11 @@
         render();
       } catch (e) {
         // On a background refresh, keep the stale results on screen rather
-        // than wiping them out with an error.
+        // than wiping them out with an error, but still say it failed.
+        if (refresh) {
+          refreshFailed = true;
+          renderLastUpdated();
+        }
         if (!background) {
           app.innerHTML = '<div class="error">Failed to load PRs. Check that `gh` is installed and authenticated.</div>';
         }
@@ -826,6 +835,9 @@
       if (waiting) {
         text += `${text ? " · " : ""}${rateLimited ? "GitHub rate limit hit, " : ""}next refresh ${formatTime(nextRefreshAt)}`;
       }
+      if (refreshFailed) {
+        text += `${text ? " · " : ""}refresh failed, check the server log`;
+      }
       lastUpdated.textContent = text;
     }
 
@@ -979,8 +991,25 @@
       fetchPRs();
     }
 
-    // Keep the "Updated Xm ago" label and Refresh button current between fetches.
-    setInterval(renderLastUpdated, 60 * 1000);
+    // Pick up the server's hourly refresh without a reload. This only reads the
+    // server's saved results, so it costs no GitHub quota; re-render only when
+    // they changed so selections aren't cleared every minute.
+    async function checkForNewResults() {
+      try {
+        const res = await fetch("/api/prs");
+        const fetchedAt = Date.parse(res.headers.get("X-Fetched-At")) || null;
+        if (fetchedAt && fetchedAt !== lastFetched) {
+          await fetchPRs({ background: true });
+        }
+      } catch {
+        // The server may be restarting; try again next minute.
+      }
+    }
+
+    setInterval(() => {
+      renderLastUpdated();
+      checkForNewResults();
+    }, 60 * 1000);
   </script>
 </body>
 </html>
